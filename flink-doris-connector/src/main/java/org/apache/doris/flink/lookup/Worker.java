@@ -17,20 +17,29 @@
 
 package org.apache.doris.flink.lookup;
 
-import org.apache.flink.annotation.VisibleForTesting;
-import org.apache.flink.table.types.DataType;
-
+import cn.hutool.core.convert.Convert;
+import cn.hutool.core.util.ObjectUtil;
+import cn.hutool.core.util.StrUtil;
+import cn.hutool.json.JSONArray;
+import cn.hutool.json.JSONObject;
+import cn.hutool.json.JSONUtil;
 import org.apache.doris.flink.cfg.DorisLookupOptions;
 import org.apache.doris.flink.cfg.DorisOptions;
 import org.apache.doris.flink.connection.JdbcConnectionProvider;
 import org.apache.doris.flink.connection.SimpleJdbcConnectionProvider;
 import org.apache.doris.flink.exception.DorisRuntimeException;
+import org.apache.flink.annotation.VisibleForTesting;
+import org.apache.flink.table.types.DataType;
+import org.apache.flink.table.types.logical.LogicalTypeRoot;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.math.BigDecimal;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
+import java.time.LocalDate;
+import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
@@ -52,11 +61,7 @@ public class Worker implements Runnable {
     private final int maxRetryTimes;
     private AtomicReference<Throwable> exception = new AtomicReference<>(null);
 
-    public Worker(
-            AtomicBoolean started,
-            DorisOptions options,
-            DorisLookupOptions lookupOptions,
-            int index) {
+    public Worker(AtomicBoolean started, DorisOptions options, DorisLookupOptions lookupOptions, int index) {
         this.started = started;
         this.name = "Worker-" + index;
         this.jdbcConnectionProvider = new SimpleJdbcConnectionProvider(options);
@@ -102,33 +107,19 @@ public class Worker implements Runnable {
         LookupSchema schema = action.getGetList().get(0).getRecord().getSchema();
         List<Get> recordList = action.getGetList();
         List<Get> deduplicateList = deduplicateRecords(recordList);
-        LOG.debug(
-                "record size {}, after deduplicate size {}",
-                recordList.size(),
-                deduplicateList.size());
+        LOG.debug("record size {}, after deduplicate size {}", recordList.size(), deduplicateList.size());
         StringBuilder sb = new StringBuilder();
-        boolean first;
-        for (int i = 0; i < deduplicateList.size(); i++) {
+        appendSelect(sb, schema);
+        for (int i = 0; i < schema.getConditionFields().length; i++) {
             if (i > 0) {
-                sb.append(" union all ");
+                sb.append(" and ");
             }
-            first = true;
-            appendSelect(sb, schema);
-            sb.append(" where ( ");
-            for (String condition : schema.getConditionFields()) {
-                if (!first) {
-                    sb.append(" and ");
-                }
-                first = false;
-                sb.append(quoteIdentifier(condition)).append("=?");
-            }
-            sb.append(" ) ");
+            String whereClause = getWhereClause(schema.getConditionFields()[i], deduplicateList.size());
+            sb.append(whereClause);
         }
-
         String sql = sb.toString();
         try {
-            Map<RecordKey, List<Record>> resultRecordMap =
-                    executeQuery(sql, deduplicateList, schema);
+            Map<RecordKey, List<Record>> resultRecordMap = executeQuery(sql, deduplicateList, schema);
             for (Get get : recordList) {
                 Record record = get.getRecord();
                 if (get.getFuture() != null) {
@@ -155,14 +146,7 @@ public class Worker implements Runnable {
         if (recordList == null || recordList.size() <= 1) {
             return recordList;
         }
-        Set<Get> recordSet =
-                new TreeSet<>(
-                        (r1, r2) ->
-                                Arrays.equals(
-                                                r1.getRecord().getValues(),
-                                                r2.getRecord().getValues())
-                                        ? 0
-                                        : -1);
+        Set<Get> recordSet = new TreeSet<>((r1, r2) -> Arrays.equals(r1.getRecord().getValues(), r2.getRecord().getValues()) ? 0 : -1);
         recordSet.addAll(recordList);
         return new ArrayList<>(recordSet);
     }
@@ -180,8 +164,15 @@ public class Worker implements Runnable {
         sb.append(" from ").append(schema.getTableIdentifier());
     }
 
-    private Map<RecordKey, List<Record>> executeQuery(
-            String sql, List<Get> recordList, LookupSchema schema) {
+    private String getWhereClause(String condition, int markSize) {
+        List<String> markArray = new ArrayList<>();
+        for (int size = markSize; size > 0; size--) {
+            markArray.add("?");
+        }
+        return " where " + quoteIdentifier(condition) + " in (" + String.join(",", markArray) + ")";
+    }
+
+    private Map<RecordKey, List<Record>> executeQuery(String sql, List<Get> recordList, LookupSchema schema) {
         Map<RecordKey, List<Record>> resultRecordMap = new HashMap<>();
         // retry strategy
         for (int retry = 0; retry <= maxRetryTimes; retry++) {
@@ -203,21 +194,48 @@ public class Worker implements Runnable {
                             Record record = new Record(schema);
                             DataType[] fieldTypes = schema.getFieldTypes();
                             for (int index = 0; index < fieldTypes.length; index++) {
-                                Class<?> conversionClass = fieldTypes[index].getConversionClass();
-                                record.setObject(index, rs.getObject(index + 1, conversionClass));
+                                DataType fieldType = fieldTypes[index];
+                                LogicalTypeRoot fieldTypeRoot = fieldType.getLogicalType().getTypeRoot();
+                                if (fieldTypeRoot == LogicalTypeRoot.ARRAY) {
+                                    String arrayValueStr = rs.getString(index + 1);
+                                    if (StrUtil.isNotBlank(arrayValueStr)) {
+                                        JSONArray arrayValueJson = JSONUtil.parseArray(arrayValueStr);
+                                        LogicalTypeRoot childrenType = fieldType.getLogicalType().getChildren().get(0).getTypeRoot();
+                                        Class<?> conversionType = getConversionType(childrenType);
+                                        List<?> arrayValue = arrayValueJson.toList(conversionType);
+                                        record.setObject(index, arrayValue);
+                                    } else {
+                                        record.setObject(index, arrayValueStr);
+                                    }
+                                } else if (fieldTypeRoot == LogicalTypeRoot.MAP) {
+                                    Object mapValueStr = rs.getObject(index + 1);
+                                    if (ObjectUtil.isNotNull(mapValueStr) && JSONUtil.isTypeJSON(mapValueStr.toString())) {
+                                        LogicalTypeRoot keyTypeRoot = fieldType.getLogicalType().getChildren().get(0).getTypeRoot();
+                                        Class<?> conversionKeyType = getConversionType(keyTypeRoot);
+                                        LogicalTypeRoot valueTypeRoot = fieldType.getLogicalType().getChildren().get(1).getTypeRoot();
+                                        Class<?> conversionValueType = getConversionType(valueTypeRoot);
+                                        Map<Object, Object> mapValueMap = new HashMap<>();
+                                        JSONObject valueJsonObject = JSONUtil.parseObj(mapValueStr);
+                                        for (Map.Entry<String, Object> entry : valueJsonObject.entrySet()) {
+                                            Object convertKey = Convert.convert(conversionKeyType, entry.getKey());
+                                            Object convertValue = Convert.convert(conversionValueType, entry.getValue());
+                                            mapValueMap.put(convertKey, convertValue);
+                                        }
+                                        record.setObject(index, mapValueMap);
+                                    } else {
+                                        record.setObject(index, mapValueStr);
+                                    }
+                                } else {
+                                    Class<?> conversionClass = fieldTypes[index].getConversionClass();
+                                    record.setObject(index, rs.getObject(index + 1, conversionClass));
+                                }
                             }
-                            List<Record> records =
-                                    resultRecordMap.computeIfAbsent(
-                                            new RecordKey(record), m -> new ArrayList<>());
+                            List<Record> records = resultRecordMap.computeIfAbsent(new RecordKey(record), m -> new ArrayList<>());
                             records.add(record);
                         }
                     }
                 }
-                LOG.debug(
-                        "query cost {}ms, batch {} records, sql is {}",
-                        System.currentTimeMillis() - start,
-                        recordList.size(),
-                        sql);
+                LOG.debug("query cost {}ms, batch {} records, sql is {}", System.currentTimeMillis() - start, recordList.size(), sql);
                 return resultRecordMap;
             } catch (Exception e) {
                 LOG.error(String.format("query doris error, retry times = %d", retry), e);
@@ -240,5 +258,37 @@ public class Worker implements Runnable {
 
     public String toString() {
         return name;
+    }
+
+    private Class<?> getConversionType(LogicalTypeRoot logicalTypeRoot) {
+        switch (logicalTypeRoot) {
+            case CHAR:
+            case VARCHAR:
+                return String.class;
+            case BOOLEAN:
+                return Boolean.class;
+            case TINYINT:
+                return Byte.class;
+            case SMALLINT:
+                return Short.class;
+            case INTEGER:
+                return Integer.class;
+            case BIGINT:
+                return Long.class;
+            case FLOAT:
+                return Float.class;
+            case DOUBLE:
+                return Double.class;
+            case DATE:
+                return LocalDate.class;
+            case TIMESTAMP_WITH_TIME_ZONE:
+                return OffsetDateTime.class;
+            case DECIMAL:
+                return BigDecimal.class;
+            case ARRAY:
+            case MAP:
+            default:
+                return Object.class;
+        }
     }
 }
