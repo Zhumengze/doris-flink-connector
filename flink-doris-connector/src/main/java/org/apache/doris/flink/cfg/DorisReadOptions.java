@@ -39,6 +39,8 @@ public class DorisReadOptions implements Serializable {
     private boolean useOldApi;
     private boolean useFlightSql;
     private Integer flightSqlPort;
+    // for flink sql limit push down
+    private Long rowLimit;
 
     public DorisReadOptions(
             String readFields,
@@ -54,7 +56,8 @@ public class DorisReadOptions implements Serializable {
             Boolean deserializeArrowAsync,
             boolean useOldApi,
             boolean useFlightSql,
-            Integer flightSqlPort) {
+            Integer flightSqlPort,
+            Long rowLimit) {
         this.readFields = readFields;
         this.filterQuery = filterQuery;
         this.requestTabletSize = requestTabletSize;
@@ -69,6 +72,7 @@ public class DorisReadOptions implements Serializable {
         this.useOldApi = useOldApi;
         this.useFlightSql = useFlightSql;
         this.flightSqlPort = flightSqlPort;
+        this.rowLimit = rowLimit;
     }
 
     public String getReadFields() {
@@ -135,6 +139,14 @@ public class DorisReadOptions implements Serializable {
         return flightSqlPort;
     }
 
+    public Long getRowLimit() {
+        return rowLimit;
+    }
+
+    public void setRowLimit(Long rowLimit) {
+        this.rowLimit = rowLimit;
+    }
+
     public static Builder builder() {
         return new Builder();
     }
@@ -165,7 +177,8 @@ public class DorisReadOptions implements Serializable {
                 && Objects.equals(deserializeQueueSize, that.deserializeQueueSize)
                 && Objects.equals(deserializeArrowAsync, that.deserializeArrowAsync)
                 && Objects.equals(useFlightSql, that.useFlightSql)
-                && Objects.equals(flightSqlPort, that.flightSqlPort);
+                && Objects.equals(flightSqlPort, that.flightSqlPort)
+                && Objects.equals(rowLimit, that.rowLimit);
     }
 
     @Override
@@ -184,7 +197,8 @@ public class DorisReadOptions implements Serializable {
                 deserializeArrowAsync,
                 useOldApi,
                 useFlightSql,
-                flightSqlPort);
+                flightSqlPort,
+                rowLimit);
     }
 
     public DorisReadOptions copy() {
@@ -202,7 +216,8 @@ public class DorisReadOptions implements Serializable {
                 deserializeArrowAsync,
                 useOldApi,
                 useFlightSql,
-                flightSqlPort);
+                flightSqlPort,
+                rowLimit);
     }
 
     /** Builder of {@link DorisReadOptions}. */
@@ -210,18 +225,24 @@ public class DorisReadOptions implements Serializable {
 
         private String readFields;
         private String filterQuery;
-        private Integer requestTabletSize;
-        private Integer requestConnectTimeoutMs;
-        private Integer requestReadTimeoutMs;
-        private Integer requestQueryTimeoutS;
-        private Integer requestRetries;
-        private Integer requestBatchSize;
-        private Long execMemLimit;
-        private Integer deserializeQueueSize;
-        private Boolean deserializeArrowAsync;
+        private Integer requestTabletSize = ConfigurationOptions.DORIS_TABLET_SIZE_DEFAULT;
+        private Integer requestConnectTimeoutMs =
+                ConfigurationOptions.DORIS_REQUEST_CONNECT_TIMEOUT_MS_DEFAULT;
+        private Integer requestReadTimeoutMs =
+                ConfigurationOptions.DORIS_REQUEST_READ_TIMEOUT_MS_DEFAULT;
+        private Integer requestQueryTimeoutS =
+                ConfigurationOptions.DORIS_REQUEST_QUERY_TIMEOUT_S_DEFAULT;
+        private Integer requestRetries = ConfigurationOptions.DORIS_REQUEST_RETRIES_DEFAULT;
+        private Integer requestBatchSize = ConfigurationOptions.DORIS_BATCH_SIZE_DEFAULT;
+        private Long execMemLimit = ConfigurationOptions.DORIS_EXEC_MEM_LIMIT_DEFAULT;
+        private Integer deserializeQueueSize =
+                ConfigurationOptions.DORIS_DESERIALIZE_QUEUE_SIZE_DEFAULT;
+        private Boolean deserializeArrowAsync =
+                ConfigurationOptions.DORIS_DESERIALIZE_ARROW_ASYNC_DEFAULT;
         private Boolean useOldApi = false;
-        private Boolean useFlightSql = false;
+        private Boolean useFlightSql = ConfigurationOptions.USE_FLIGHT_SQL_DEFAULT;
         private Integer flightSqlPort;
+        private Long rowLimit;
 
         /**
          * Sets the readFields for doris table to push down projection, such as name,age.
@@ -401,7 +422,8 @@ public class DorisReadOptions implements Serializable {
                     deserializeArrowAsync,
                     useOldApi,
                     useFlightSql,
-                    flightSqlPort);
+                    flightSqlPort,
+                    rowLimit);
         }
     }
 }

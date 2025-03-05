@@ -42,10 +42,11 @@ import org.apache.doris.flink.sink.writer.WriteMode;
 import org.apache.doris.flink.sink.writer.serializer.DorisRecordSerializer;
 import org.apache.doris.flink.sink.writer.serializer.JsonDebeziumSchemaSerializer;
 import org.apache.doris.flink.table.DorisConfigOptions;
+import org.apache.doris.flink.tools.cdc.converter.TableNameConverter;
+import org.apache.doris.flink.tools.cdc.oracle.OracleDatabaseSync;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.Serializable;
 import java.sql.Connection;
 import java.sql.SQLException;
 import java.sql.SQLSyntaxErrorException;
@@ -58,6 +59,7 @@ import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 
 import static org.apache.flink.cdc.debezium.utils.JdbcUrlUtils.PROPERTIES_PREFIX;
 
@@ -113,7 +115,7 @@ public abstract class DatabaseSync {
         this.converter = new TableNameConverter(tablePrefix, tableSuffix, multiToOneRulesPattern);
     }
 
-    public void build() throws Exception {
+    public boolean build() throws Exception {
         DorisConnectionOptions options = getDorisConnectionOptions();
         DorisSystem dorisSystem = new DorisSystem(options);
 
@@ -156,7 +158,7 @@ public abstract class DatabaseSync {
         }
         if (createTableOnly) {
             System.out.println("Create table finished.");
-            System.exit(0);
+            return false;
         }
         LOG.info("table mapping: {}", tableMapping);
         config.setString(TABLE_NAME_OPTIONS, getSyncTableList(syncTables));
@@ -168,7 +170,7 @@ public abstract class DatabaseSync {
                     streamSource.process(buildProcessFunction());
             for (Tuple2<String, String> dbTbl : dorisTables) {
                 OutputTag<String> recordOutputTag =
-                        ParsingProcessFunction.createRecordOutputTag(dbTbl.f1);
+                        ParsingProcessFunction.createRecordOutputTag(dbTbl.f0, dbTbl.f1);
                 DataStream<String> sideOutput = parsedStream.getSideOutput(recordOutputTag);
                 int sinkParallel =
                         sinkConfig.getInteger(
@@ -181,6 +183,7 @@ public abstract class DatabaseSync {
                         .uid(uidName);
             }
         }
+        return true;
     }
 
     /**
@@ -227,7 +230,7 @@ public abstract class DatabaseSync {
     }
 
     public ParsingProcessFunction buildProcessFunction() {
-        return new ParsingProcessFunction(converter);
+        return new ParsingProcessFunction(database, converter);
     }
 
     /** create doris sink. */
@@ -340,6 +343,7 @@ public abstract class DatabaseSync {
                 .setTargetDatabase(database)
                 .setTargetTablePrefix(tablePrefix)
                 .setTargetTableSuffix(tableSuffix)
+                .setTableNameConverter(converter)
                 .build();
     }
 
@@ -358,7 +362,14 @@ public abstract class DatabaseSync {
 
     protected String getSyncTableList(List<String> syncTables) {
         if (!singleSink) {
-            return String.format("(%s)\\.(%s)", getTableListPrefix(), String.join("|", syncTables));
+            if (this instanceof OracleDatabaseSync) {
+                return syncTables.stream()
+                        .map(v -> getTableListPrefix() + "\\." + v)
+                        .collect(Collectors.joining("|"));
+            } else {
+                return String.format(
+                        "(%s)\\.(%s)", getTableListPrefix(), String.join("|", syncTables));
+            }
         } else {
             // includingTablePattern and ^excludingPattern
             if (includingTables == null) {
@@ -462,9 +473,14 @@ public abstract class DatabaseSync {
     private void tryCreateTableIfAbsent(
             DorisSystem dorisSystem, String targetDb, String dorisTable, SourceSchema schema) {
         if (!dorisSystem.tableExists(targetDb, dorisTable)) {
+            if (dorisTableConfig.isConvertUniqToPk()
+                    && CollectionUtil.isNullOrEmpty(schema.primaryKeys)
+                    && !CollectionUtil.isNullOrEmpty(schema.uniqueIndexs)) {
+                schema.primaryKeys = new ArrayList<>(schema.uniqueIndexs);
+            }
             TableSchema dorisSchema =
                     DorisSchemaFactory.createTableSchema(
-                            database,
+                            targetDb,
                             dorisTable,
                             schema.getFields(),
                             schema.getPrimaryKeys(),
@@ -602,52 +618,5 @@ public abstract class DatabaseSync {
     public DatabaseSync setTableSuffix(String tableSuffix) {
         this.tableSuffix = tableSuffix;
         return this;
-    }
-
-    public static class TableNameConverter implements Serializable {
-        private static final long serialVersionUID = 1L;
-        private final String prefix;
-        private final String suffix;
-        private Map<Pattern, String> multiToOneRulesPattern;
-
-        TableNameConverter() {
-            this("", "");
-        }
-
-        TableNameConverter(String prefix, String suffix) {
-            this.prefix = prefix == null ? "" : prefix;
-            this.suffix = suffix == null ? "" : suffix;
-        }
-
-        TableNameConverter(
-                String prefix, String suffix, Map<Pattern, String> multiToOneRulesPattern) {
-            this.prefix = prefix == null ? "" : prefix;
-            this.suffix = suffix == null ? "" : suffix;
-            this.multiToOneRulesPattern = multiToOneRulesPattern;
-        }
-
-        public String convert(String tableName) {
-            if (multiToOneRulesPattern == null) {
-                return prefix + tableName + suffix;
-            }
-
-            String target = null;
-
-            for (Map.Entry<Pattern, String> patternStringEntry :
-                    multiToOneRulesPattern.entrySet()) {
-                if (patternStringEntry.getKey().matcher(tableName).matches()) {
-                    target = patternStringEntry.getValue();
-                }
-            }
-            /**
-             * If multiToOneRulesPattern is not null and target is not assigned, then the
-             * synchronization task contains both multi to one and one to one , prefixes and
-             * suffixes are added to common one-to-one mapping tables
-             */
-            if (target == null) {
-                return prefix + tableName + suffix;
-            }
-            return target;
-        }
     }
 }
