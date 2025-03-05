@@ -29,6 +29,7 @@ import org.apache.flink.table.connector.source.ScanTableSource;
 import org.apache.flink.table.connector.source.SourceProvider;
 import org.apache.flink.table.connector.source.TableFunctionProvider;
 import org.apache.flink.table.connector.source.abilities.SupportsFilterPushDown;
+import org.apache.flink.table.connector.source.abilities.SupportsLimitPushDown;
 import org.apache.flink.table.connector.source.abilities.SupportsProjectionPushDown;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.expressions.ResolvedExpression;
@@ -58,7 +59,8 @@ public final class DorisDynamicTableSource
         implements ScanTableSource,
                 LookupTableSource,
                 SupportsFilterPushDown,
-                SupportsProjectionPushDown {
+                SupportsProjectionPushDown,
+                SupportsLimitPushDown {
 
     private static final Logger LOG = LoggerFactory.getLogger(DorisDynamicTableSource.class);
     private final DorisOptions options;
@@ -90,8 +92,12 @@ public final class DorisDynamicTableSource
 
     @Override
     public ScanRuntimeProvider getScanRuntimeProvider(ScanContext runtimeProviderContext) {
-        if (StringUtils.isNullOrWhitespaceOnly(readOptions.getFilterQuery())) {
+        if (!resolvedFilterQuery.isEmpty()) {
             String filterQuery = resolvedFilterQuery.stream().collect(Collectors.joining(" AND "));
+            if (!StringUtils.isNullOrWhitespaceOnly(readOptions.getFilterQuery())) {
+                filterQuery =
+                        String.format("(%s) AND (%s)", readOptions.getFilterQuery(), filterQuery);
+            }
             readOptions.setFilterQuery(filterQuery);
         }
 
@@ -195,8 +201,7 @@ public final class DorisDynamicTableSource
         DorisExpressionVisitor expressionVisitor = new DorisExpressionVisitor();
         for (ResolvedExpression filter : filters) {
             String filterQuery = filter.accept(expressionVisitor);
-            if (StringUtils.isNullOrWhitespaceOnly(readOptions.getFilterQuery())
-                    && !StringUtils.isNullOrWhitespaceOnly(filterQuery)) {
+            if (!StringUtils.isNullOrWhitespaceOnly(filterQuery)) {
                 acceptedFilters.add(filter);
                 this.resolvedFilterQuery.add(filterQuery);
             } else {
@@ -252,5 +257,11 @@ public final class DorisDynamicTableSource
                 physicalSchema,
                 resolvedFilterQuery,
                 physicalRowDataType);
+    }
+
+    @Override
+    public void applyLimit(long limit) {
+        // partial limit push down to reduce the amount of data scanned
+        readOptions.setRowLimit(limit);
     }
 }

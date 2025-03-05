@@ -346,7 +346,7 @@ public class DorisWriter<IN>
                                 dorisOptions,
                                 executionOptions,
                                 labelGenerator,
-                                new HttpUtil().getHttpClient()));
+                                new HttpUtil(dorisReadOptions).getHttpClient()));
     }
 
     /** Check the streamload http request regularly. */
@@ -458,7 +458,6 @@ public class DorisWriter<IN>
         if (scheduledExecutorService != null) {
             scheduledExecutorService.shutdownNow();
         }
-        LOG.info("Try to abort txn before closing.");
         abortPossibleSuccessfulTransaction();
 
         if (dorisStreamLoadMap != null && !dorisStreamLoadMap.isEmpty()) {

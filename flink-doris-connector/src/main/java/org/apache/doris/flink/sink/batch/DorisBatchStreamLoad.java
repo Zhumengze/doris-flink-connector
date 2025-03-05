@@ -33,7 +33,6 @@ import org.apache.doris.flink.sink.BackendUtil;
 import org.apache.doris.flink.sink.EscapeHandler;
 import org.apache.doris.flink.sink.HttpPutBuilder;
 import org.apache.doris.flink.sink.HttpUtil;
-import org.apache.doris.flink.sink.LoadStatus;
 import org.apache.doris.flink.sink.writer.LabelGenerator;
 import org.apache.http.client.entity.GzipCompressingEntity;
 import org.apache.http.client.methods.CloseableHttpResponse;
@@ -64,7 +63,9 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 import static org.apache.doris.flink.sink.LoadStatus.PUBLISH_TIMEOUT;
 import static org.apache.doris.flink.sink.LoadStatus.SUCCESS;
@@ -103,7 +104,7 @@ public class DorisBatchStreamLoad implements Serializable {
     private final AtomicBoolean started;
     private volatile boolean loadThreadAlive = false;
     private AtomicReference<Throwable> exception = new AtomicReference<>(null);
-    private HttpClientBuilder httpClientBuilder = new HttpUtil().getHttpClientBuilderForBatch();
+    private HttpClientBuilder httpClientBuilder;
     private BackendUtil backendUtil;
     private boolean enableGroupCommit;
     private boolean enableGzCompress;
@@ -112,6 +113,7 @@ public class DorisBatchStreamLoad implements Serializable {
     private final AtomicLong currentCacheBytes = new AtomicLong(0L);
     private final Lock lock = new ReentrantLock();
     private final Condition block = lock.newCondition();
+    private final Map<String, ReadWriteLock> bufferMapLock = new ConcurrentHashMap<>();
 
     public DorisBatchStreamLoad(
             DorisOptions dorisOptions,
@@ -170,6 +172,7 @@ public class DorisBatchStreamLoad implements Serializable {
         this.started = new AtomicBoolean(true);
         this.loadExecutorService.execute(loadAsyncExecutor);
         this.subTaskId = subTaskId;
+        this.httpClientBuilder = new HttpUtil(dorisReadOptions).getHttpClientBuilderForBatch();
     }
 
     /**
@@ -178,10 +181,11 @@ public class DorisBatchStreamLoad implements Serializable {
      * @param record
      * @throws IOException
      */
-    public synchronized void writeRecord(String database, String table, byte[] record) {
+    public void writeRecord(String database, String table, byte[] record) {
         checkFlushException();
         String bufferKey = getTableIdentifier(database, table);
 
+        getLock(bufferKey).readLock().lock();
         BatchRecordBuffer buffer =
                 bufferMap.computeIfAbsent(
                         bufferKey,
@@ -194,6 +198,8 @@ public class DorisBatchStreamLoad implements Serializable {
 
         int bytes = buffer.insert(record);
         currentCacheBytes.addAndGet(bytes);
+        getLock(bufferKey).readLock().unlock();
+
         if (currentCacheBytes.get() > maxBlockedBytes) {
             lock.lock();
             try {
@@ -228,15 +234,15 @@ public class DorisBatchStreamLoad implements Serializable {
         }
     }
 
-    public synchronized boolean bufferFullFlush(String bufferKey) {
+    public boolean bufferFullFlush(String bufferKey) {
         return doFlush(bufferKey, false, true);
     }
 
-    public synchronized boolean intervalFlush() {
+    public boolean intervalFlush() {
         return doFlush(null, false, false);
     }
 
-    public synchronized boolean checkpointFlush() {
+    public boolean checkpointFlush() {
         return doFlush(null, true, false);
     }
 
@@ -254,6 +260,11 @@ public class DorisBatchStreamLoad implements Serializable {
     }
 
     private synchronized boolean flush(String bufferKey, boolean waitUtilDone) {
+        if (!waitUtilDone && bufferMap.isEmpty()) {
+            // bufferMap may have been flushed by other threads
+            LOG.info("bufferMap is empty, no need to flush {}", bufferKey);
+            return false;
+        }
         if (null == bufferKey) {
             boolean flush = false;
             for (String key : bufferMap.keySet()) {
@@ -270,7 +281,7 @@ public class DorisBatchStreamLoad implements Serializable {
         } else if (bufferMap.containsKey(bufferKey)) {
             flushBuffer(bufferKey);
         } else {
-            throw new DorisBatchLoadException("buffer not found for key: " + bufferKey);
+            LOG.warn("buffer not found for key: {}, may be already flushed.", bufferKey);
         }
         if (waitUtilDone) {
             waitAsyncLoadFinish();
@@ -279,10 +290,20 @@ public class DorisBatchStreamLoad implements Serializable {
     }
 
     private synchronized void flushBuffer(String bufferKey) {
-        BatchRecordBuffer buffer = bufferMap.get(bufferKey);
+        BatchRecordBuffer buffer;
+        try {
+            getLock(bufferKey).writeLock().lock();
+            buffer = bufferMap.remove(bufferKey);
+        } finally {
+            getLock(bufferKey).writeLock().unlock();
+        }
+        if (buffer == null) {
+            LOG.info("buffer key is not exist {}, skipped", bufferKey);
+            return;
+        }
         buffer.setLabelName(labelGenerator.generateBatchLabel(buffer.getTable()));
+        LOG.debug("flush buffer for key {} with label {}", bufferKey, buffer.getLabelName());
         putRecordToFlushQueue(buffer);
-        bufferMap.remove(bufferKey);
     }
 
     private void putRecordToFlushQueue(BatchRecordBuffer buffer) {
@@ -295,6 +316,9 @@ public class DorisBatchStreamLoad implements Serializable {
         } catch (InterruptedException e) {
             throw new RuntimeException("Failed to put record buffer to flush queue");
         }
+        // When the load thread reports an error, the flushQueue will be cleared,
+        // and need to force a check for the exception.
+        checkFlushException();
     }
 
     private void checkFlushException() {
@@ -304,7 +328,9 @@ public class DorisBatchStreamLoad implements Serializable {
     }
 
     private void waitAsyncLoadFinish() {
-        for (int i = 0; i < executionOptions.getFlushQueueSize() + 1; i++) {
+        // Because the queue will have a drainTo operation, it needs to be multiplied by 2
+        for (int i = 0; i < executionOptions.getFlushQueueSize() * 2 + 1; i++) {
+            // eof buffer
             BatchRecordBuffer empty = new BatchRecordBuffer();
             putRecordToFlushQueue(empty);
         }
@@ -318,8 +344,6 @@ public class DorisBatchStreamLoad implements Serializable {
         // close async executor
         this.loadExecutorService.shutdown();
         this.started.set(false);
-        // clear buffer
-        this.flushQueue.clear();
     }
 
     @VisibleForTesting
@@ -369,6 +393,10 @@ public class DorisBatchStreamLoad implements Serializable {
         return true;
     }
 
+    private ReadWriteLock getLock(String bufferKey) {
+        return bufferMapLock.computeIfAbsent(bufferKey, k -> new ReentrantReadWriteLock());
+    }
+
     class LoadAsyncExecutor implements Runnable {
 
         private int flushQueueSize;
@@ -386,10 +414,14 @@ public class DorisBatchStreamLoad implements Serializable {
                 recordList.clear();
                 try {
                     BatchRecordBuffer buffer = flushQueue.poll(2000L, TimeUnit.MILLISECONDS);
-                    if (buffer == null || buffer.getLabelName() == null) {
-                        // label is empty and does not need to load. It is the flag of waitUtilDone
+                    if (buffer == null) {
                         continue;
                     }
+                    if (buffer.getLabelName() == null) {
+                        // When the label is empty, it is the eof buffer for checkpoint flush.
+                        continue;
+                    }
+
                     recordList.add(buffer);
                     boolean merge = false;
                     if (!flushQueue.isEmpty()) {
@@ -403,15 +435,11 @@ public class DorisBatchStreamLoad implements Serializable {
                     if (!merge) {
                         for (BatchRecordBuffer bf : recordList) {
                             if (bf == null || bf.getLabelName() == null) {
+                                // When the label is empty, it's eof buffer for checkpointFlush.
                                 continue;
                             }
                             load(bf.getLabelName(), bf);
                         }
-                    }
-
-                    if (flushQueue.size() < flushQueueSize) {
-                        // Avoid waiting for 2 rounds of intervalMs
-                        doFlush(null, false, false);
                     }
                 } catch (Exception e) {
                     LOG.error("worker running error", e);
@@ -481,11 +509,6 @@ public class DorisBatchStreamLoad implements Serializable {
                                     lock.unlock();
                                 }
                                 return;
-                            } else if (LoadStatus.LABEL_ALREADY_EXIST.equals(
-                                    respContent.getStatus())) {
-                                // todo: need to abort transaction when JobStatus not finished
-                                putBuilder.setLabel(label + "_" + retry);
-                                reason = respContent.getMessage();
                             } else {
                                 String errMsg = null;
                                 if (StringUtils.isBlank(respContent.getMessage())
@@ -522,6 +545,7 @@ public class DorisBatchStreamLoad implements Serializable {
                 // get available backend retry
                 refreshLoadUrl(buffer.getDatabase(), buffer.getTable());
                 putBuilder.setUrl(loadUrl);
+                putBuilder.setLabel(label + "_" + retry);
             }
             buffer.clear();
             buffer = null;
