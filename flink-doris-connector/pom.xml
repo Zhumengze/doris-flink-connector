@@ -111,6 +111,12 @@ under the License.
             <version>${flink.version}</version>
             <scope>provided</scope>
         </dependency>
+        <dependency>
+            <groupId>cn.hutool</groupId>
+            <artifactId>hutool-all</artifactId>
+            <version>5.8.21</version>
+            <scope>provided</scope>
+        </dependency>
 
         <dependency>
             <groupId>org.apache.flink</groupId>
@@ -574,11 +580,11 @@ under the License.
                 <artifactId>maven-surefire-plugin</artifactId>
                 <version>2.22.0</version>
                 <configuration>
-                <!-- skip itcase e2ecase in mvn package
-                <includes>
-                      <include>**/*.java</include>
-                 </includes>
-                 -->
+                    <!-- skip itcase e2ecase in mvn package
+                    <includes>
+                          <include>**/*.java</include>
+                     </includes>
+                     -->
                 </configuration>
             </plugin>
             <plugin>
